@@ -1,0 +1,36 @@
+name: All checks
+on:
+  push:
+    tags:
+      - 'v[0-9]+'
+      - 'v[0-9]+-*'
+      - 'v[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+-*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+    branches:
+      - '**'
+  pull_request: ~
+
+jobs:
+  qa:
+    uses: EO-DataHub/github-actions/.github/workflows/qa-python.yaml@main
+
+  security-scan:
+    name: Call Security Scan
+    uses: EO-DataHub/github-actions/.github/workflows/security.yaml@main
+
+  unit-tests:
+    name: Run unit tests
+    uses: EO-DataHub/github-actions/.github/workflows/unit-tests-python-uv.yaml@main
+
+  publish:
+    name: Build and push Docker image
+    uses: EO-DataHub/github-actions/.github/workflows/ecr-publish.yaml@main
+    with:
+      image_name: ${{ vars.IMAGE_NAME }}
+      aws_role_arn: ${{ vars.AWS_ROLE_ARN }}
+      aws_ecr_alias: ${{ vars.AWS_ECR_ALIAS }}
+    permissions:
+      id-token: write
+      contents: read
