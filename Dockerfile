@@ -22,7 +22,9 @@ FROM ghcr.io/astral-sh/uv:python3.13-trixie-slim@sha256:f4adb3fe11f03f693466c36a
 RUN apt-get update -y && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 app
 
-ENV UV_NO_DEV=1
+# The virtualenv's own binaries, not `uv run`: the app user has no home directory for uv's
+# cache, and the environment is complete at build time.
+ENV PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
@@ -34,4 +36,6 @@ EXPOSE 8000
 
 # --proxy-headers: the access log records the client's address from X-Forwarded-For, as set
 # by the ingress controller, not the controller's own address.
-CMD ["uv", "run", "--no-sync", "uvicorn", "data_objects.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# --no-access-log: the app writes its own JSON access line for each object request, and
+# uvicorn's would add a second, plain-text line, plus one for every health probe.
+CMD ["uvicorn", "data_objects.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "*", "--no-access-log"]
