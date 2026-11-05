@@ -162,6 +162,5 @@ cython_debug/
 
 
 *.bak
-.pre-commit-config.yaml
 *.http
 http-client.*.json
