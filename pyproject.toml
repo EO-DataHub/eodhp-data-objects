@@ -1,0 +1,45 @@
+[project]
+name = "eodhp-data-objects"
+version = "0.1.0"
+description = "Signs reads of objects in allowlisted S3 buckets, including requester-pays buckets, and charges them to a workspace (ADR-003)"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+license = { file = "LICENSE" }
+dependencies = [
+    "boto3>=1.35",
+    "fastapi>=0.115",
+    "pyjwt[crypto]>=2.10",
+    "uvicorn>=0.32",
+]
+
+[dependency-groups]
+dev = [
+    "httpx2",
+    "pre-commit",
+    "pyright>=1.1.390",
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+[project.urls]
+repository = "https://github.com/EO-DataHub/eodhp-data-objects"
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+include = ["data_objects", "tests"]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
