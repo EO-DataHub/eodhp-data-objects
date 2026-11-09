@@ -76,6 +76,10 @@ class Signer:
         self._now = now
         self._s3_factory = s3_factory or _s3_client
         self._sessions: dict[tuple[str, str], _Session] = {}
+        # One lock per workspace and region, held while its session is renewed, so a slow STS
+        # call holds up only that workspace. `_lock` guards the two dicts and is never held
+        # across an STS call.
+        self._renewal_locks: dict[tuple[str, str], threading.Lock] = {}
         self._lock = threading.Lock()
 
     def presign(self, *, workspace: str, bucket: Bucket, key: str) -> str:
@@ -119,10 +123,17 @@ class Signer:
         return ObjectHead(headers=headers)
 
     def _session(self, workspace: str, region: str) -> _Session:
+        key = (workspace, region)
         with self._lock:
-            cached = self._sessions.get((workspace, region))
-            if cached and cached.expires - self._now() > self._refresh_margin:
+            if cached := self._fresh(key):
                 return cached
+            renewal_lock = self._renewal_locks.setdefault(key, threading.Lock())
+
+        with renewal_lock:
+            # Another request may have renewed the session while this one waited.
+            with self._lock:
+                if cached := self._fresh(key):
+                    return cached
 
             credentials = self._sts.assume_role(
                 RoleArn=self._role_arn,
@@ -130,8 +141,16 @@ class Signer:
                 DurationSeconds=int(self._session_duration.total_seconds()),
             )["Credentials"]
             session = _Session(s3=self._s3_factory(credentials, region), expires=credentials["Expiration"])
-            self._sessions[(workspace, region)] = session
+            with self._lock:
+                self._sessions[key] = session
             return session
+
+    def _fresh(self, key: tuple[str, str]) -> _Session | None:
+        """The cached session, if more than the refresh margin remains. Call with `_lock` held."""
+        cached = self._sessions.get(key)
+        if cached and cached.expires - self._now() > self._refresh_margin:
+            return cached
+        return None
 
 
 def _request_payer_in_query(request: Any, **_: Any) -> None:

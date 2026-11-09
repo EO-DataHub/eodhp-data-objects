@@ -1,11 +1,13 @@
+import threading
 from datetime import timedelta
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from botocore.awsrequest import AWSRequest
 from botocore.exceptions import ClientError
 
-from data_objects.signer import Missing, ObjectHead, Signer, _request_payer_in_query
+from data_objects.signer import Missing, ObjectHead, Signer, _request_payer_in_query, _s3_client
 from tests.conftest import LANDSAT, OPEN_BUCKET, ROLE, Clock, FakeS3, FakeSTS, s3_error
 
 KEY = "collection02/level-2/standard/oli-tirs/2024/048/022/X/X_MTL.json"
@@ -132,3 +134,61 @@ def test_payer_hook_moves_the_payer_into_a_presigned_query() -> None:
     _request_payer_in_query(request)
     assert "x-amz-request-payer" not in request.headers
     assert request.url == "https://b.s3.us-west-2.amazonaws.com/k?x-amz-request-payer=requester"
+
+
+class BlockingSTS(FakeSTS):
+    """Holds AssumeRole for one session name until released, to stand in for a slow STS."""
+
+    def __init__(self, clock: Clock, slow_session: str) -> None:
+        super().__init__(clock)
+        self._slow_session = slow_session
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def assume_role(self, **kwargs: Any) -> dict[str, Any]:
+        if kwargs["RoleSessionName"] == self._slow_session:
+            self.entered.set()
+            assert self.release.wait(timeout=5)
+        return super().assume_role(**kwargs)
+
+
+def blocking_signer(clock: Clock, sts: FakeSTS) -> Signer:
+    return Signer(
+        ROLE,
+        url_lifetime=timedelta(minutes=15),
+        session_duration=timedelta(hours=1),
+        refresh_margin=timedelta(minutes=20),
+        sts=sts,
+        now=clock,
+        s3_factory=_s3_client,
+    )
+
+
+def test_slow_sts_for_one_workspace_does_not_hold_up_another(clock: Clock) -> None:
+    sts = BlockingSTS(clock, "slow-ws")
+    signer = blocking_signer(clock, sts)
+    slow = threading.Thread(target=presign, args=(signer, "slow-ws"))
+    slow.start()
+    try:
+        assert sts.entered.wait(timeout=5)
+        done = threading.Thread(target=presign, args=(signer, "fast-ws"))
+        done.start()
+        done.join(timeout=5)
+        assert not done.is_alive(), "fast-ws waited behind slow-ws's STS call"
+    finally:
+        sts.release.set()
+        slow.join(timeout=5)
+
+
+def test_concurrent_requests_for_one_workspace_share_one_sts_call(clock: Clock) -> None:
+    sts = BlockingSTS(clock, "a-ws")
+    signer = blocking_signer(clock, sts)
+    threads = [threading.Thread(target=presign, args=(signer, "a-ws")) for _ in range(3)]
+    threads[0].start()
+    assert sts.entered.wait(timeout=5)
+    for t in threads[1:]:
+        t.start()
+    sts.release.set()
+    for t in threads:
+        t.join(timeout=5)
+    assert len(sts.calls) == 1
