@@ -55,6 +55,10 @@ def test_required_setting_missing_is_refused(name: str) -> None:
         ({"URL_LIFETIME_SECONDS": "0"}, "must be positive"),
         ({"SESSION_REFRESH_MARGIN_SECONDS": "3600"}, "shorter than the session duration"),
         ({"SESSION_DURATION_SECONDS": "86400"}, "12 hours"),
+        (
+            {"SESSION_DURATION_SECONDS": "600", "SESSION_REFRESH_MARGIN_SECONDS": "300", "URL_LIFETIME_SECONDS": "300"},
+            "15 minutes",
+        ),
         ({"URL_LIFETIME_SECONDS": "15m"}, "whole number of seconds"),
         ({"BUCKETS": "[]"}, "allowlist is empty"),
         ({"BUCKETS": '[{"name": "x"}]'}, "JSON list"),

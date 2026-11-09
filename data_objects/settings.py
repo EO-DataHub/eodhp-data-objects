@@ -10,7 +10,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
 
-# STS refuses a role session longer than 12 hours.
+# STS refuses a role session shorter than 15 minutes or longer than 12 hours.
+MIN_SESSION_DURATION = timedelta(minutes=15)
 MAX_SESSION_DURATION = timedelta(hours=12)
 
 DEFAULT_URL_LIFETIME = timedelta(minutes=15)
@@ -74,6 +75,8 @@ class Settings:
             )
         if self.refresh_margin >= self.session_duration:
             raise SettingsError("The session refresh margin must be shorter than the session duration")
+        if self.session_duration < MIN_SESSION_DURATION:
+            raise SettingsError("STS sessions must last at least 15 minutes")
         if self.session_duration > MAX_SESSION_DURATION:
             raise SettingsError("STS sessions cannot last longer than 12 hours")
         if self.readiness_object.bucket not in self.buckets:

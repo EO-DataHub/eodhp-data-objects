@@ -40,10 +40,10 @@ Not built yet: the anonymous route for preview images (ADR-003, decision 6).
 | `BUCKETS` | yes | | JSON list, for example `[{"name": "usgs-landsat", "region": "us-west-2", "requester_pays": true}]`. `requester_pays` must be `true` or `false`, not a string. |
 | `READINESS_OBJECT` | yes | | `<bucket>/<key>` of an object that exists. See [Health checks](#health-checks). |
 | `URL_LIFETIME_SECONDS` | no | `900` | How long a presigned URL is valid |
-| `SESSION_DURATION_SECONDS` | no | `3600` | How long each workspace's STS session lasts. At most the role's maximum session duration. |
+| `SESSION_DURATION_SECONDS` | no | `3600` | How long each workspace's STS session lasts. At least 900, and at most the role's maximum session duration. |
 | `SESSION_REFRESH_MARGIN_SECONDS` | no | `1200` | A session is replaced when less than this remains |
 
-The service refuses to start unless `URL_LIFETIME_SECONDS` ≤ `SESSION_REFRESH_MARGIN_SECONDS` < `SESSION_DURATION_SECONDS` ≤ 12 hours. The first rule makes sure every URL is valid for its full lifetime.
+The service refuses to start unless `URL_LIFETIME_SECONDS` ≤ `SESSION_REFRESH_MARGIN_SECONDS` < `SESSION_DURATION_SECONDS`, and `SESSION_DURATION_SECONDS` is between 15 minutes and 12 hours (the limits STS sets). The first rule makes sure every URL is valid for its full lifetime.
 
 ## Health checks
 
