@@ -88,7 +88,7 @@ class Verifier:
 
 def choose_workspace(payload: dict[str, Any], header: str | None, query: str | None = None) -> str:
     """The workspace to charge: the header, else the `workspace` query parameter, else the
-    token's only workspace.
+    token's only workspace. A blank header or query value counts as missing.
 
     The query parameter is for clients that cannot send a header: a link click in the UI and
     a tile URL given to titiler. It is checked against the same claim as the header.
@@ -96,14 +96,15 @@ def choose_workspace(payload: dict[str, Any], header: str | None, query: str | N
     400 when the choice is ambiguous or malformed, 403 when the token does not grant it.
     """
     workspaces = _claim_list(payload, "workspaces")
-    named = header if header is not None else query
+    # A blank header or query value counts as missing, so it falls through to the next source.
+    named = (header or "").strip() or (query or "").strip() or None
 
     if named is None:
         if len(workspaces) != 1:
             raise AuthError(400, "Send X-EODH-Workspace or ?workspace=: the token does not name exactly one workspace")
         workspace = workspaces[0]
     else:
-        workspace = named.strip()
+        workspace = named
         if workspace not in workspaces:
             raise AuthError(403, "The token does not grant this workspace")
 

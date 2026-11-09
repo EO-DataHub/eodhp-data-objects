@@ -27,6 +27,15 @@ def test_bare_string_claim_counts_as_one_workspace() -> None:
     assert choose_workspace({"workspaces": "only-ws"}, None) == "only-ws"
 
 
+@pytest.mark.parametrize(("header", "query"), [("", None), ("  ", None), (None, ""), ("", "")])
+def test_blank_header_or_query_falls_back_to_the_single_workspace(header: str | None, query: str | None) -> None:
+    assert choose_workspace({"workspaces": ["only-ws"]}, header, query) == "only-ws"
+
+
+def test_blank_header_falls_back_to_the_query() -> None:
+    assert choose_workspace({"workspaces": ["a-ws", "b-ws"]}, "", "b-ws") == "b-ws"
+
+
 @pytest.mark.parametrize("workspaces", [[], ["a-ws", "b-ws"]])
 def test_no_header_and_no_single_workspace_is_400(workspaces: list[str]) -> None:
     with pytest.raises(AuthError) as e:

@@ -13,7 +13,7 @@ The contract is [ADR-003: URL contract for requester-pays data access](https://g
 | `GET` | `307` to a presigned S3 GET URL, with `Cache-Control: no-store`. The service does not check that the object exists. |
 | `HEAD` | Answered by the service from `HeadObject`: `200` with `Content-Length`, `Content-Type`, `ETag`, `Last-Modified` and `Accept-Ranges`. It is never redirected, because GDAL reuses the target of its first redirect for its range GETs. |
 
-The workspace is the first of these that is present: the `X-EODH-Workspace` header, the `workspace` query parameter, or the token's only workspace. It must be in the token's `workspaces` claim.
+The workspace is the first of these that is present: the `X-EODH-Workspace` header, the `workspace` query parameter, or the token's only workspace. A blank header or parameter counts as missing. It must be in the token's `workspaces` claim.
 
 | Status | When |
 |---|---|
