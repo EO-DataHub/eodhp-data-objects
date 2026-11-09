@@ -84,12 +84,16 @@ def _parse_buckets(raw: str) -> dict[str, Bucket]:
     """`BUCKETS` is a JSON list: [{"name": ..., "region": ..., "requester_pays": true}, ...]."""
     try:
         entries = json.loads(raw)
-        buckets = [
-            Bucket(name=e["name"], region=e["region"], requester_pays=bool(e["requester_pays"])) for e in entries
-        ]
+        buckets = [Bucket(name=e["name"], region=e["region"], requester_pays=e["requester_pays"]) for e in entries]
     except (ValueError, TypeError, KeyError) as e:
         msg = f"BUCKETS is not a JSON list of {{name, region, requester_pays}}: {e}"
         raise SettingsError(msg) from e
+    # Not bool(): "false" in quotes would turn requester-pays on, and the Hub would pay for
+    # reads the bucket owner should pay for.
+    for b in buckets:
+        if not isinstance(b.requester_pays, bool):
+            msg = f"BUCKETS: requester_pays for {b.name} must be true or false, got {b.requester_pays!r}"
+            raise SettingsError(msg)
     by_name = {b.name: b for b in buckets}
     if len(by_name) != len(buckets):
         raise SettingsError("BUCKETS names a bucket twice")

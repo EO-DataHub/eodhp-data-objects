@@ -37,7 +37,7 @@ Not built yet: the anonymous route for preview images (ADR-003, decision 6).
 | `KEYCLOAK_BASE_URL` | yes | | The platform URL, for example `https://hub.example`. The issuer is `<base>/keycloak/realms/<realm>`. |
 | `KEYCLOAK_REALM` | no | `eodhp` | |
 | `SIGNER_ROLE_ARN` | yes | | The role the service assumes, once per workspace. It needs `s3:GetObject` on each allowlisted bucket. |
-| `BUCKETS` | yes | | JSON list, for example `[{"name": "usgs-landsat", "region": "us-west-2", "requester_pays": true}]` |
+| `BUCKETS` | yes | | JSON list, for example `[{"name": "usgs-landsat", "region": "us-west-2", "requester_pays": true}]`. `requester_pays` must be `true` or `false`, not a string. |
 | `READINESS_OBJECT` | yes | | `<bucket>/<key>` of an object that exists. See [Health checks](#health-checks). |
 | `URL_LIFETIME_SECONDS` | no | `900` | How long a presigned URL is valid |
 | `SESSION_DURATION_SECONDS` | no | `3600` | How long each workspace's STS session lasts. At most the role's maximum session duration. |

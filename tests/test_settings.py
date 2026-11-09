@@ -58,6 +58,8 @@ def test_required_setting_missing_is_refused(name: str) -> None:
         ({"URL_LIFETIME_SECONDS": "15m"}, "whole number of seconds"),
         ({"BUCKETS": "[]"}, "allowlist is empty"),
         ({"BUCKETS": '[{"name": "x"}]'}, "JSON list"),
+        ({"BUCKETS": '[{"name": "x", "region": "r", "requester_pays": "false"}]'}, "true or false"),
+        ({"BUCKETS": '[{"name": "x", "region": "r", "requester_pays": 0}]'}, "true or false"),
         ({"BUCKETS": BUCKETS[:-1] + ', {"name": "usgs-landsat", "region": "x", "requester_pays": false}]'}, "twice"),
         ({"READINESS_OBJECT": "other-bucket/key"}, "not in an allowlisted bucket"),
         ({"READINESS_OBJECT": "usgs-landsat"}, "<bucket>/<key>"),
