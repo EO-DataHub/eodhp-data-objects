@@ -1,6 +1,9 @@
 """GET /api/data/objects/{bucket}/{key} -> 307 to a presigned GET URL (ADR-003).
 
 HEAD is answered by the endpoint itself, from a server-side HeadObject (see Signer.head).
+
+Catalogue preview images need no token when thumbnails are configured (decision 6). They
+are signed by a separate role that can read nothing else, and the Hub pays for them.
 """
 
 import json
@@ -9,7 +12,7 @@ import secrets
 import threading
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from botocore.exceptions import BotoCoreError, ClientError
@@ -18,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from data_objects.auth import AuthError, Verifier, authenticate
-from data_objects.settings import Settings
+from data_objects.settings import Bucket, ObjectRef, Settings
 from data_objects.signer import Missing, Signer
 
 ROUTE_PREFIX = "/api/data/objects"
@@ -26,6 +29,10 @@ ROUTE_PREFIX = "/api/data/objects"
 # The role session name for the readiness check. Workspace names are DNS labels, which cannot
 # contain "_", so this can never be charged to a workspace.
 READINESS_SESSION = "_readiness-check"
+
+# The role session name for preview images. The thumbnail role is separate from the signer
+# role, so this cannot be confused with a workspace in CloudTrail.
+THUMBNAIL_SESSION = "catalogue-thumbnails"
 
 access_log = logging.getLogger("data_objects.access")
 log = logging.getLogger("data_objects")
@@ -47,47 +54,58 @@ def _access(record: dict[str, Any]) -> None:
 
 
 class Readiness:
-    """HeadObject on a known object, as the signer role (ADR-003, decision 4).
+    """HeadObject on a known object, as each signing role (ADR-003, decision 4).
 
     A missing key and a broken role policy both give 403 without s3:ListBucket, so the
-    endpoint cannot tell them apart on a request. This check can: the object is known to
-    exist. Once it passes, it stays passed, so the probe costs one S3 request per pod.
+    endpoint cannot tell them apart on a request. This check can: each object is known to
+    exist. Once a role's check passes, it stays passed, so the probe costs one S3 request per
+    role per pod.
     """
 
-    def __init__(self, settings: Settings, signer: Signer) -> None:
-        self._settings = settings
-        self._signer = signer
-        self._ready = False
+    def __init__(self, buckets: dict[str, Bucket], checks: dict[str, tuple[Signer, ObjectRef]]) -> None:
+        self._buckets = buckets
+        self._pending = dict(checks)
         self._lock = threading.Lock()
 
     def check(self) -> bool:
         with self._lock:
-            if self._ready:
-                return True
-            ref = self._settings.readiness_object
-            try:
-                result = self._signer.head(
-                    workspace=READINESS_SESSION, bucket=self._settings.buckets[ref.bucket], key=ref.key
-                )
-            except (ClientError, BotoCoreError) as e:
-                log.error("Readiness check failed for %s/%s: %s", ref.bucket, ref.key, e)
-                return False
-            if isinstance(result, Missing):
-                log.error(
-                    "Readiness check failed for %s/%s: S3 returned %s %s. Check the signer role's policy.",
-                    ref.bucket,
-                    ref.key,
-                    result.s3_status,
-                    result.s3_code,
-                )
-                return False
-            self._ready = True
-            log.info("Readiness check passed for %s/%s", ref.bucket, ref.key)
-            return True
+            for role, (signer, ref) in list(self._pending.items()):
+                if self._passes(role, signer, ref):
+                    del self._pending[role]
+            return not self._pending
+
+    def _passes(self, role: str, signer: Signer, ref: ObjectRef) -> bool:
+        try:
+            result = signer.head(workspace=READINESS_SESSION, bucket=self._buckets[ref.bucket], key=ref.key)
+        except (ClientError, BotoCoreError) as e:
+            log.error("Readiness check failed for the %s role on %s/%s: %s", role, ref.bucket, ref.key, e)
+            return False
+        if isinstance(result, Missing):
+            log.error(
+                "Readiness check failed for the %s role on %s/%s: S3 returned %s %s. Check the role's policy.",
+                role,
+                ref.bucket,
+                ref.key,
+                result.s3_status,
+                result.s3_code,
+            )
+            return False
+        log.info("Readiness check passed for the %s role on %s/%s", role, ref.bucket, ref.key)
+        return True
 
 
-def create_app(settings: Settings, *, signer: Signer, verifier: Verifier) -> FastAPI:
-    readiness = Readiness(settings, signer)
+def create_app(
+    settings: Settings, *, signer: Signer, verifier: Verifier, thumbnail_signer: Signer | None = None
+) -> FastAPI:
+    thumbnails = settings.thumbnails
+    if (thumbnails is None) != (thumbnail_signer is None):
+        msg = "Pass a thumbnail signer exactly when thumbnails are configured"
+        raise ValueError(msg)
+
+    checks: dict[str, tuple[Signer, ObjectRef]] = {"signer": (signer, settings.readiness_object)}
+    if thumbnails is not None and thumbnail_signer is not None:
+        checks["thumbnail"] = (thumbnail_signer, thumbnails.readiness_object)
+    readiness = Readiness(dict(settings.buckets), checks)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncGenerator[None]:
@@ -140,6 +158,13 @@ def create_app(settings: Settings, *, signer: Signer, verifier: Verifier) -> Fas
             _access(record | {"status": 404})
             return JSONResponse({"detail": "Not found"}, status_code=404)
 
+        if thumbnails is not None and thumbnail_signer is not None and thumbnails.matches(key):
+            # No token needed, and any token is ignored: a preview costs the Hub the same
+            # whoever views it, so no workspace is charged.
+            return _thumbnail(
+                record | {"thumbnail": True}, request.method, thumbnail_signer, allowed, key, thumbnails.cache_max_age
+            )
+
         try:
             caller = authenticate(
                 verifier,
@@ -178,3 +203,37 @@ def create_app(settings: Settings, *, signer: Signer, verifier: Verifier) -> Fas
         )
 
     return app
+
+
+def _thumbnail(
+    record: dict[str, Any], method: str, signer: Signer, bucket: Bucket, key: str, cache_max_age: timedelta
+) -> Response:
+    request_id = record["id"]
+    if method == "HEAD":
+        try:
+            head = signer.head(workspace=THUMBNAIL_SESSION, bucket=bucket, key=key)
+        except (ClientError, BotoCoreError) as e:
+            _access(record | {"status": 502, "error": str(e)[:200]})
+            return Response(status_code=502, headers={"X-Request-Id": request_id})
+        if isinstance(head, Missing):
+            _access(record | {"status": 404, "s3_status": head.s3_status, "s3_code": head.s3_code})
+            return Response(status_code=404, headers={"X-Request-Id": request_id})
+        _access(record | {"status": 200})
+        return Response(status_code=200, headers=head.headers | {"X-Request-Id": request_id})
+
+    try:
+        url = signer.presign(workspace=THUMBNAIL_SESSION, bucket=bucket, key=key)
+    except (ClientError, BotoCoreError) as e:
+        _access(record | {"status": 502, "error": str(e)[:200]})
+        return JSONResponse({"detail": "Cannot sign the request"}, status_code=502)
+    _access(record | {"status": 307})
+    # A browser may reuse this redirect, so a catalogue page shown again does not ask the
+    # endpoint, or sign, again. Settings keeps max-age shorter than the URL lifetime.
+    return Response(
+        status_code=307,
+        headers={
+            "Location": url,
+            "Cache-Control": f"max-age={int(cache_max_age.total_seconds())}",
+            "X-Request-Id": request_id,
+        },
+    )

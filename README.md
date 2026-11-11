@@ -28,7 +28,19 @@ A `403` from `HeadObject` becomes `404`, because without `s3:ListBucket` S3 answ
 
 Each request writes one JSON line to the `data_objects.access` log on stdout. The line records the chosen workspace, the token's `sub`, the key and the `Range` header. It records the `Authorization` header's scheme and length, never the token.
 
-Not built yet: the anonymous route for preview images (ADR-003, decision 6).
+### Preview images
+
+When `THUMBNAIL_ROLE_ARN` is set, catalogue preview images need no token (ADR-003, decision 6). A preview is a key that ends with one of `THUMBNAIL_SUFFIXES`, in an allowlisted bucket. By default the suffixes are Landsat's `_thumb_small.jpeg` and `_thumb_large.jpeg`.
+
+- The service signs previews as the thumbnail role, with the session name `catalogue-thumbnails`. That role's IAM policy should allow only preview keys, so a bug in the service cannot sign a read of data.
+- The Hub pays, and no workspace is charged. A token sent with a preview is ignored, even one that is not valid.
+- A GET returns `307` with `Cache-Control: max-age=<THUMBNAIL_CACHE_SECONDS>`, so a browser reuses the redirect instead of asking again for each page view.
+- HEAD is answered from `HeadObject`, as for other objects.
+- The access log line has `"thumbnail": true` and no workspace.
+
+The service does not limit how often a preview is requested. The ingress that serves previews without a login must do that.
+
+Without `THUMBNAIL_ROLE_ARN`, previews need a token like any other object.
 
 ## Configuration
 
@@ -42,13 +54,17 @@ Not built yet: the anonymous route for preview images (ADR-003, decision 6).
 | `URL_LIFETIME_SECONDS` | no | `900` | How long a presigned URL is valid |
 | `SESSION_DURATION_SECONDS` | no | `3600` | How long each workspace's STS session lasts. At least 900, and at most the role's maximum session duration. |
 | `SESSION_REFRESH_MARGIN_SECONDS` | no | `1200` | A session is replaced when less than this remains |
+| `THUMBNAIL_ROLE_ARN` | no | | The role that signs preview images. Setting it makes previews anonymous. |
+| `THUMBNAIL_READINESS_OBJECT` | with `THUMBNAIL_ROLE_ARN` | | `<bucket>/<key>` of a preview image that exists |
+| `THUMBNAIL_SUFFIXES` | no | `_thumb_small.jpeg,_thumb_large.jpeg` | Comma-separated key endings that mark a preview. They must match the thumbnail role's IAM policy. |
+| `THUMBNAIL_CACHE_SECONDS` | no | `300` | `max-age` on a preview redirect. Must be shorter than `URL_LIFETIME_SECONDS`. |
 
 The service refuses to start unless `URL_LIFETIME_SECONDS` ≤ `SESSION_REFRESH_MARGIN_SECONDS` < `SESSION_DURATION_SECONDS`, and `SESSION_DURATION_SECONDS` is between 15 minutes and 12 hours (the limits STS sets). The first rule makes sure every URL is valid for its full lifetime.
 
 ## Health checks
 
 - `/healthz` returns `200` while the process runs.
-- `/readyz` returns `200` once a `HeadObject` on `READINESS_OBJECT`, as the signer role, has succeeded, and `503` until then. A missing key and a broken role policy both give `403` on a request, so this check is how a broken policy shows. It runs at startup and again on each probe until it passes. Its role session is named `_readiness-check`, which cannot be a workspace name.
+- `/readyz` returns `200` once a `HeadObject` on `READINESS_OBJECT` as the signer role, and on `THUMBNAIL_READINESS_OBJECT` as the thumbnail role if it is set, have succeeded, and `503` until then. A missing key and a broken role policy both give `403` on a request, so this check is how a broken policy shows. It runs at startup and again on each probe until it passes. Its role session is named `_readiness-check`, which cannot be a workspace name.
 
 ## Development
 

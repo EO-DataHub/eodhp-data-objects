@@ -18,6 +18,10 @@ DEFAULT_URL_LIFETIME = timedelta(minutes=15)
 DEFAULT_SESSION_DURATION = timedelta(hours=1)
 DEFAULT_REFRESH_MARGIN = timedelta(minutes=20)
 
+# Catalogue preview images (ADR-003, decision 6): the two Landsat Collection 2 browse images.
+DEFAULT_THUMBNAIL_SUFFIXES = ("_thumb_small.jpeg", "_thumb_large.jpeg")
+DEFAULT_THUMBNAIL_CACHE = timedelta(minutes=5)
+
 
 class SettingsError(ValueError):
     pass
@@ -47,6 +51,28 @@ class ObjectRef:
 
 
 @dataclass(frozen=True)
+class Thumbnails:
+    """Anonymous preview images (ADR-003, decision 6).
+
+    A key that ends with one of `suffixes`, in an allowlisted bucket, needs no token. The
+    endpoint signs it as `role_arn`, whose IAM policy allows only these keys, so a bug here
+    cannot sign a read of data. The Hub pays, and no workspace is charged.
+    """
+
+    role_arn: str
+    # A preview image that exists, read at startup as `role_arn`, as READINESS_OBJECT is for
+    # the signer role.
+    readiness_object: ObjectRef
+    suffixes: tuple[str, ...] = DEFAULT_THUMBNAIL_SUFFIXES
+    # How long a browser may reuse the redirect. Must be shorter than the URL lifetime, or a
+    # browser could follow a cached redirect to an expired URL.
+    cache_max_age: timedelta = DEFAULT_THUMBNAIL_CACHE
+
+    def matches(self, key: str) -> bool:
+        return key.endswith(self.suffixes)
+
+
+@dataclass(frozen=True)
 class Settings:
     keycloak_issuer: str
     signer_role_arn: str
@@ -63,6 +89,8 @@ class Settings:
     # The Keycloak client IDs platform tokens are issued for. The same list is in
     # accounting-service's authz.py; change them together.
     jwt_audience: tuple[str, ...] = ("eodh", "eodh-workspaces")
+    # None: preview images need a token, like any other object.
+    thumbnails: Thumbnails | None = None
 
     def __post_init__(self) -> None:
         if not self.buckets:
@@ -81,6 +109,23 @@ class Settings:
             raise SettingsError("STS sessions cannot last longer than 12 hours")
         if self.readiness_object.bucket not in self.buckets:
             raise SettingsError("The readiness object is not in an allowlisted bucket")
+        if self.thumbnails is not None:
+            self._check_thumbnails(self.thumbnails)
+
+    def _check_thumbnails(self, thumbnails: Thumbnails) -> None:
+        if not thumbnails.suffixes or not all(thumbnails.suffixes):
+            raise SettingsError("THUMBNAIL_SUFFIXES has an empty entry")
+        if not thumbnails.matches(thumbnails.readiness_object.key):
+            raise SettingsError("The thumbnail readiness object does not end with a thumbnail suffix")
+        if thumbnails.readiness_object.bucket not in self.buckets:
+            raise SettingsError("The thumbnail readiness object is not in an allowlisted bucket")
+        if thumbnails.cache_max_age < timedelta(0):
+            raise SettingsError("THUMBNAIL_CACHE_SECONDS cannot be negative")
+        if thumbnails.cache_max_age >= self.url_lifetime:
+            raise SettingsError(
+                "THUMBNAIL_CACHE_SECONDS must be shorter than the URL lifetime, "
+                "or a browser could follow a cached redirect to an expired URL"
+            )
 
 
 def _parse_buckets(raw: str) -> dict[str, Bucket]:
@@ -122,6 +167,21 @@ def _seconds(env: Mapping[str, str], name: str, default: timedelta) -> timedelta
         raise SettingsError(msg) from e
 
 
+def _thumbnails(env: Mapping[str, str]) -> Thumbnails | None:
+    """Set when THUMBNAIL_ROLE_ARN is. Without it, preview images need a token."""
+    role_arn = env.get("THUMBNAIL_ROLE_ARN", "").strip()
+    if not role_arn:
+        return None
+    raw_suffixes = env.get("THUMBNAIL_SUFFIXES", "").strip()
+    suffixes = tuple(s.strip() for s in raw_suffixes.split(",")) if raw_suffixes else DEFAULT_THUMBNAIL_SUFFIXES
+    return Thumbnails(
+        role_arn=role_arn,
+        readiness_object=ObjectRef.parse(_required(env, "THUMBNAIL_READINESS_OBJECT")),
+        suffixes=suffixes,
+        cache_max_age=_seconds(env, "THUMBNAIL_CACHE_SECONDS", DEFAULT_THUMBNAIL_CACHE),
+    )
+
+
 def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
     # The issuer is compared with the token's `iss` exactly, so a trailing slash would refuse
     # every token. Built the same way as accounting-service's.
@@ -136,4 +196,5 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         url_lifetime=_seconds(env, "URL_LIFETIME_SECONDS", DEFAULT_URL_LIFETIME),
         session_duration=_seconds(env, "SESSION_DURATION_SECONDS", DEFAULT_SESSION_DURATION),
         refresh_margin=_seconds(env, "SESSION_REFRESH_MARGIN_SECONDS", DEFAULT_REFRESH_MARGIN),
+        thumbnails=_thumbnails(env),
     )

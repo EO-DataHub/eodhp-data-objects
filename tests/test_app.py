@@ -162,7 +162,8 @@ def test_not_ready_while_the_role_cannot_read_the_known_object(
     s3_errors[READINESS_KEY] = s3_error(403, "403")
     with client:
         assert client.get("/readyz").status_code == 503
-        assert "Check the signer role's policy" in caplog.text
+        assert "for the signer role" in caplog.text
+        assert "Check the role's policy" in caplog.text
 
         del s3_errors[READINESS_KEY]  # the policy is fixed
         assert client.get("/readyz").status_code == 200

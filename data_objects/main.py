@@ -18,14 +18,25 @@ logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(message)s")
 
 settings = load_settings()
 
-app = create_app(
-    settings,
-    signer=Signer(
-        settings.signer_role_arn,
+log = logging.getLogger("data_objects")
+
+
+def _signer(role_arn: str) -> Signer:
+    return Signer(
+        role_arn,
         url_lifetime=settings.url_lifetime,
         session_duration=settings.session_duration,
         refresh_margin=settings.refresh_margin,
-    ),
+    )
+
+
+if settings.thumbnails is None:
+    log.info("THUMBNAIL_ROLE_ARN is not set: preview images need a token, like any other object")
+
+app = create_app(
+    settings,
+    signer=_signer(settings.signer_role_arn),
+    thumbnail_signer=_signer(settings.thumbnails.role_arn) if settings.thumbnails else None,
     verifier=Verifier(
         issuer=settings.keycloak_issuer,
         audience=settings.jwt_audience,

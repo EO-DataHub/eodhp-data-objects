@@ -83,3 +83,51 @@ def test_settings_check_their_rules_when_built_directly() -> None:
             readiness_object=ObjectRef("b", "k"),
             url_lifetime=timedelta(minutes=30),
         )
+
+
+THUMBNAIL_ENV = {
+    "THUMBNAIL_ROLE_ARN": "arn:aws:iam::123456789012:role/data-objects-thumbnails",
+    "THUMBNAIL_READINESS_OBJECT": "usgs-landsat/collection02/x/X_thumb_small.jpeg",
+}
+
+
+def test_thumbnails_are_off_without_a_role() -> None:
+    assert load_settings(ENV).thumbnails is None
+
+
+def test_thumbnails_load_with_the_adr_defaults() -> None:
+    thumbnails = load_settings(ENV | THUMBNAIL_ENV).thumbnails
+
+    assert thumbnails is not None
+    assert thumbnails.role_arn == THUMBNAIL_ENV["THUMBNAIL_ROLE_ARN"]
+    assert thumbnails.readiness_object == ObjectRef("usgs-landsat", "collection02/x/X_thumb_small.jpeg")
+    assert thumbnails.suffixes == ("_thumb_small.jpeg", "_thumb_large.jpeg")
+    assert thumbnails.cache_max_age == timedelta(minutes=5)
+
+
+def test_thumbnail_suffixes_and_cache_are_configurable() -> None:
+    thumbnails = load_settings(
+        ENV
+        | THUMBNAIL_ENV
+        | {"THUMBNAIL_SUFFIXES": " _thumb_small.jpeg , _browse.png", "THUMBNAIL_CACHE_SECONDS": "60"}
+    ).thumbnails
+
+    assert thumbnails is not None
+    assert thumbnails.suffixes == ("_thumb_small.jpeg", "_browse.png")
+    assert thumbnails.cache_max_age == timedelta(minutes=1)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"THUMBNAIL_READINESS_OBJECT": ""}, "THUMBNAIL_READINESS_OBJECT must be set"),
+        ({"THUMBNAIL_READINESS_OBJECT": "usgs-landsat/x/X_MTL.json"}, "does not end with a thumbnail suffix"),
+        ({"THUMBNAIL_READINESS_OBJECT": "other/x_thumb_small.jpeg"}, "not in an allowlisted bucket"),
+        ({"THUMBNAIL_SUFFIXES": "_thumb_small.jpeg,,"}, "empty entry"),
+        ({"THUMBNAIL_CACHE_SECONDS": "900"}, "shorter than the URL lifetime"),
+        ({"THUMBNAIL_CACHE_SECONDS": "-1"}, "cannot be negative"),
+    ],
+)
+def test_inconsistent_thumbnail_settings_stop_startup(overrides: dict[str, str], message: str) -> None:
+    with pytest.raises(SettingsError, match=message):
+        load_settings(ENV | THUMBNAIL_ENV | overrides)
