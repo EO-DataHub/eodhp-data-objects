@@ -158,7 +158,7 @@ def create_app(
             _access(record | {"status": 404})
             return JSONResponse({"detail": "Not found"}, status_code=404)
 
-        if thumbnails is not None and thumbnail_signer is not None and thumbnails.matches(key):
+        if thumbnails is not None and thumbnail_signer is not None and allowed.is_thumbnail(key):
             # No token needed, and any token is ignored: a preview costs the Hub the same
             # whoever views it, so no workspace is charged.
             return _thumbnail(

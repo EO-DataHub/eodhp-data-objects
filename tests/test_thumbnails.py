@@ -15,7 +15,7 @@ from data_objects.app import THUMBNAIL_SESSION, create_app
 from data_objects.auth import Verifier
 from data_objects.settings import ObjectRef, Settings, Thumbnails
 from data_objects.signer import Signer, _s3_client
-from tests.conftest import LANDSAT, ROLE, Clock, FakeS3, FakeSTS, s3_error
+from tests.conftest import LANDSAT, OPEN_BUCKET, ROLE, Clock, FakeS3, FakeSTS, s3_error
 
 THUMBNAIL_ROLE = "arn:aws:iam::123456789012:role/data-objects-thumbnails"
 SCENE = "collection02/level-2/standard/oli-tirs/2024/092/079/LC08_X/LC08_X"
@@ -23,12 +23,14 @@ SMALL = f"/api/data/objects/usgs-landsat/{SCENE}_thumb_small.jpeg"
 LARGE = f"/api/data/objects/usgs-landsat/{SCENE}_thumb_large.jpeg"
 DATA = f"/api/data/objects/usgs-landsat/{SCENE}_SR_B4.TIF"
 THUMBNAIL_READINESS_KEY = "collection02/x/X_thumb_small.jpeg"
+LANDSAT_WITH_PREVIEWS = dataclasses.replace(LANDSAT, thumbnail_suffixes=("_thumb_small.jpeg", "_thumb_large.jpeg"))
 
 
 @pytest.fixture
 def thumbnail_settings(settings: Settings) -> Settings:
     return dataclasses.replace(
         settings,
+        buckets={b.name: b for b in (LANDSAT_WITH_PREVIEWS, OPEN_BUCKET)},
         thumbnails=Thumbnails(
             role_arn=THUMBNAIL_ROLE, readiness_object=ObjectRef(LANDSAT.name, THUMBNAIL_READINESS_KEY)
         ),
@@ -118,6 +120,13 @@ def test_data_is_still_signed_by_the_signer_role(thumbnail_client: TestClient, s
 )
 def test_only_an_exact_suffix_is_a_preview(thumbnail_client: TestClient, key: str) -> None:
     assert thumbnail_client.get(f"/api/data/objects/usgs-landsat/{key}").status_code == 401
+
+
+def test_preview_suffix_in_a_bucket_without_previews_needs_a_token(thumbnail_client: TestClient, sts: FakeSTS) -> None:
+    # The suffixes belong to a bucket. The same key ending elsewhere is data, signed for a
+    # workspace, and never by the thumbnail role, whose policy covers only Landsat previews.
+    assert thumbnail_client.get(f"/api/data/objects/{OPEN_BUCKET.name}/x_thumb_small.jpeg").status_code == 401
+    assert sts.calls == []
 
 
 def test_preview_in_a_bucket_not_on_the_allowlist_is_404(thumbnail_client: TestClient) -> None:
