@@ -18,6 +18,8 @@ DEFAULT_URL_LIFETIME = timedelta(minutes=15)
 DEFAULT_SESSION_DURATION = timedelta(hours=1)
 DEFAULT_REFRESH_MARGIN = timedelta(minutes=20)
 
+DEFAULT_THUMBNAIL_CACHE = timedelta(minutes=5)
+
 
 class SettingsError(ValueError):
     pass
@@ -30,6 +32,13 @@ class Bucket:
     name: str
     region: str
     requester_pays: bool
+    # Key endings that mark a catalogue preview image in this bucket (ADR-003, decision 6).
+    # A preview needs no token, and the Hub pays for it. Empty: every key needs a token.
+    # They must match the thumbnail role's IAM policy for this bucket.
+    thumbnail_suffixes: tuple[str, ...] = ()
+
+    def is_thumbnail(self, key: str) -> bool:
+        return bool(self.thumbnail_suffixes) and key.endswith(self.thumbnail_suffixes)
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,24 @@ class ObjectRef:
             msg = f"Expected <bucket>/<key>, got {value!r}"
             raise SettingsError(msg)
         return cls(bucket, key)
+
+
+@dataclass(frozen=True)
+class Thumbnails:
+    """Anonymous preview images (ADR-003, decision 6).
+
+    A key that ends with one of its bucket's `thumbnail_suffixes` needs no token. The
+    endpoint signs it as `role_arn`, whose IAM policy allows only these keys, so a bug here
+    cannot sign a read of data. The Hub pays, and no workspace is charged.
+    """
+
+    role_arn: str
+    # A preview image that exists, read at startup as `role_arn`, as READINESS_OBJECT is for
+    # the signer role. It must be a preview by the same rule that requests use.
+    readiness_object: ObjectRef
+    # How long a browser may reuse the redirect. Must be shorter than the URL lifetime, or a
+    # browser could follow a cached redirect to an expired URL.
+    cache_max_age: timedelta = DEFAULT_THUMBNAIL_CACHE
 
 
 @dataclass(frozen=True)
@@ -63,6 +90,8 @@ class Settings:
     # The Keycloak client IDs platform tokens are issued for. The same list is in
     # accounting-service's authz.py; change them together.
     jwt_audience: tuple[str, ...] = ("eodh", "eodh-workspaces")
+    # None: preview images need a token, like any other object.
+    thumbnails: Thumbnails | None = None
 
     def __post_init__(self) -> None:
         if not self.buckets:
@@ -81,14 +110,55 @@ class Settings:
             raise SettingsError("STS sessions cannot last longer than 12 hours")
         if self.readiness_object.bucket not in self.buckets:
             raise SettingsError("The readiness object is not in an allowlisted bucket")
+        with_previews = [b.name for b in self.buckets.values() if b.thumbnail_suffixes]
+        if self.thumbnails is None:
+            if with_previews:
+                names = ", ".join(with_previews)
+                msg = f"BUCKETS sets thumbnail_suffixes for {names}, but THUMBNAIL_ROLE_ARN is not set"
+                raise SettingsError(msg)
+        else:
+            self._check_thumbnails(self.thumbnails)
+
+    def is_thumbnail(self, bucket: str, key: str) -> bool:
+        """True if the key is a preview image that needs no token."""
+        allowed = self.buckets.get(bucket)
+        return self.thumbnails is not None and allowed is not None and allowed.is_thumbnail(key)
+
+    def _check_thumbnails(self, thumbnails: Thumbnails) -> None:
+        if not any(b.thumbnail_suffixes for b in self.buckets.values()):
+            raise SettingsError("THUMBNAIL_ROLE_ARN is set, but no bucket in BUCKETS has thumbnail_suffixes")
+        ref = thumbnails.readiness_object
+        if ref.bucket not in self.buckets:
+            raise SettingsError("The thumbnail readiness object is not in an allowlisted bucket")
+        if not self.is_thumbnail(ref.bucket, ref.key):
+            raise SettingsError(
+                "The thumbnail readiness object does not end with one of its bucket's thumbnail_suffixes"
+            )
+        if thumbnails.cache_max_age < timedelta(0):
+            raise SettingsError("THUMBNAIL_CACHE_SECONDS cannot be negative")
+        if thumbnails.cache_max_age >= self.url_lifetime:
+            raise SettingsError(
+                "THUMBNAIL_CACHE_SECONDS must be shorter than the URL lifetime, "
+                "or a browser could follow a cached redirect to an expired URL"
+            )
 
 
 def _parse_buckets(raw: str) -> dict[str, Bucket]:
-    """`BUCKETS` is a JSON list: [{"name": ..., "region": ..., "requester_pays": true}, ...]."""
+    """`BUCKETS` is a JSON list of {"name", "region", "requester_pays", "thumbnail_suffixes"?}."""
     try:
         entries = json.loads(raw)
-        buckets = [Bucket(name=e["name"], region=e["region"], requester_pays=e["requester_pays"]) for e in entries]
-    except (ValueError, TypeError, KeyError) as e:
+        buckets = [
+            Bucket(
+                name=e["name"],
+                region=e["region"],
+                requester_pays=e["requester_pays"],
+                thumbnail_suffixes=_thumbnail_suffixes(e["name"], e.get("thumbnail_suffixes", [])),
+            )
+            for e in entries
+        ]
+    except SettingsError:
+        raise
+    except (ValueError, TypeError, KeyError, AttributeError) as e:
         msg = f"BUCKETS is not a JSON list of {{name, region, requester_pays}}: {e}"
         raise SettingsError(msg) from e
     # Not bool(): "false" in quotes would turn requester-pays on, and the Hub would pay for
@@ -101,6 +171,13 @@ def _parse_buckets(raw: str) -> dict[str, Bucket]:
     if len(by_name) != len(buckets):
         raise SettingsError("BUCKETS names a bucket twice")
     return by_name
+
+
+def _thumbnail_suffixes(bucket: str, value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(s, str) and s for s in value):
+        msg = f"BUCKETS: thumbnail_suffixes for {bucket} must be a list of non-empty strings"
+        raise SettingsError(msg)
+    return tuple(value)
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -122,6 +199,18 @@ def _seconds(env: Mapping[str, str], name: str, default: timedelta) -> timedelta
         raise SettingsError(msg) from e
 
 
+def _thumbnails(env: Mapping[str, str]) -> Thumbnails | None:
+    """Set when THUMBNAIL_ROLE_ARN is. Without it, preview images need a token."""
+    role_arn = env.get("THUMBNAIL_ROLE_ARN", "").strip()
+    if not role_arn:
+        return None
+    return Thumbnails(
+        role_arn=role_arn,
+        readiness_object=ObjectRef.parse(_required(env, "THUMBNAIL_READINESS_OBJECT")),
+        cache_max_age=_seconds(env, "THUMBNAIL_CACHE_SECONDS", DEFAULT_THUMBNAIL_CACHE),
+    )
+
+
 def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
     # The issuer is compared with the token's `iss` exactly, so a trailing slash would refuse
     # every token. Built the same way as accounting-service's.
@@ -136,4 +225,5 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         url_lifetime=_seconds(env, "URL_LIFETIME_SECONDS", DEFAULT_URL_LIFETIME),
         session_duration=_seconds(env, "SESSION_DURATION_SECONDS", DEFAULT_SESSION_DURATION),
         refresh_margin=_seconds(env, "SESSION_REFRESH_MARGIN_SECONDS", DEFAULT_REFRESH_MARGIN),
+        thumbnails=_thumbnails(env),
     )
