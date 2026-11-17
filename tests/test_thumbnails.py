@@ -5,17 +5,16 @@ import json
 import logging
 from datetime import timedelta
 from typing import Any
-from urllib.parse import parse_qs, urlparse
 
 import pytest
 from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
-from data_objects.app import THUMBNAIL_SESSION, create_app
+from data_objects.app import MAX_PREVIEW_BYTES, THUMBNAIL_SESSION, create_app
 from data_objects.auth import Verifier
 from data_objects.settings import ObjectRef, Settings, Thumbnails
 from data_objects.signer import Signer, _s3_client
-from tests.conftest import LANDSAT, OPEN_BUCKET, ROLE, Clock, FakeS3, FakeSTS, s3_error
+from tests.conftest import LANDSAT, OPEN_BUCKET, PREVIEW_JPEG, ROLE, Clock, FakeS3, FakeSTS, s3_error
 
 THUMBNAIL_ROLE = "arn:aws:iam::123456789012:role/data-objects-thumbnails"
 SCENE = "collection02/level-2/standard/oli-tirs/2024/092/079/LC08_X/LC08_X"
@@ -44,9 +43,10 @@ def thumbnail_signer(
     clock: Clock,
     s3_clients: list[FakeS3],
     s3_errors: dict[str, ClientError],
+    s3_sizes: dict[str, int],
 ) -> Signer:
     def factory(credentials: dict[str, Any], region: str) -> FakeS3:
-        s3_clients.append(FakeS3(_s3_client(credentials, region), s3_errors))
+        s3_clients.append(FakeS3(_s3_client(credentials, region), s3_errors, s3_sizes))
         return s3_clients[-1]
 
     return Signer(
@@ -69,13 +69,55 @@ def thumbnail_client(
 
 
 @pytest.mark.parametrize("path", [SMALL, LARGE])
-def test_preview_needs_no_token(thumbnail_client: TestClient, path: str) -> None:
+def test_preview_needs_no_token_and_returns_the_image(
+    thumbnail_client: TestClient, s3_clients: list[FakeS3], path: str
+) -> None:
     response = thumbnail_client.get(path)
 
-    assert response.status_code == 307
-    url = urlparse(response.headers["location"])
-    assert url.netloc == "usgs-landsat.s3.us-west-2.amazonaws.com"
-    assert parse_qs(url.query)["x-amz-request-payer"] == ["requester"]
+    assert response.status_code == 200
+    assert "location" not in response.headers
+    assert response.content == PREVIEW_JPEG
+    assert response.headers["content-type"] == "image/jpeg"
+    assert response.headers["content-length"] == str(len(PREVIEW_JPEG))
+    assert response.headers["etag"] == '"jpeg"'
+    assert response.headers["last-modified"] == "Mon, 02 Nov 2026 00:00:00 GMT"
+    get = s3_clients[0].gets[0]
+    assert (get["Bucket"], get["Key"], get["RequestPayer"]) == (
+        "usgs-landsat",
+        path.rsplit("/usgs-landsat/")[1],
+        "requester",
+    )
+    assert s3_clients[0].bodies[0].closed
+
+
+def test_preview_has_cors_headers_so_a_web_map_can_draw_it(thumbnail_client: TestClient) -> None:
+    # MapLibre draws an image source with WebGL, which refuses a cross-origin image without CORS.
+    response = thumbnail_client.get(LARGE, headers={"Origin": "https://ui.example"})
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "*"
+
+
+def test_missing_preview_is_404(thumbnail_client: TestClient, s3_errors: dict[str, ClientError]) -> None:
+    s3_errors[f"{SCENE}_thumb_large.jpeg"] = s3_error(403, "403")
+    assert thumbnail_client.get(LARGE).status_code == 404
+
+
+def test_preview_that_fails_for_another_reason_is_502(
+    thumbnail_client: TestClient, s3_errors: dict[str, ClientError]
+) -> None:
+    s3_errors[f"{SCENE}_thumb_large.jpeg"] = s3_error(503, "SlowDown")
+    assert thumbnail_client.get(LARGE).status_code == 502
+
+
+def test_oversized_preview_is_refused_without_reading_its_body(
+    thumbnail_client: TestClient, s3_sizes: dict[str, int], s3_clients: list[FakeS3]
+) -> None:
+    s3_sizes[f"{SCENE}_thumb_large.jpeg"] = MAX_PREVIEW_BYTES + 1
+
+    assert thumbnail_client.get(LARGE).status_code == 502
+    body = s3_clients[0].bodies[0]
+    assert not body.read_called
+    assert body.closed
 
 
 def test_preview_is_signed_by_the_thumbnail_role(thumbnail_client: TestClient, sts: FakeSTS) -> None:
@@ -88,18 +130,16 @@ def test_token_is_ignored_for_a_preview(thumbnail_client: TestClient, sts: FakeS
     response = thumbnail_client.get(
         SMALL, headers={"Authorization": f"Bearer {token('a-ws')}", "X-EODH-Workspace": "a-ws"}
     )
-    assert response.status_code == 307
+    assert response.status_code == 200
     assert [c["RoleSessionName"] for c in sts.calls] == [THUMBNAIL_SESSION]
 
 
 def test_even_an_invalid_token_is_ignored_for_a_preview(thumbnail_client: TestClient) -> None:
-    assert thumbnail_client.get(SMALL, headers={"Authorization": "Bearer not-a-jwt"}).status_code == 307
+    assert thumbnail_client.get(SMALL, headers={"Authorization": "Bearer not-a-jwt"}).status_code == 200
 
 
-def test_preview_redirect_may_be_cached_for_less_than_the_url_lifetime(thumbnail_client: TestClient) -> None:
-    response = thumbnail_client.get(SMALL)
-    assert response.headers["cache-control"] == "max-age=300"
-    assert parse_qs(urlparse(response.headers["location"]).query)["X-Amz-Expires"] == ["900"]
+def test_preview_may_be_cached(thumbnail_client: TestClient) -> None:
+    assert thumbnail_client.get(SMALL).headers["cache-control"] == "max-age=300"
 
 
 def test_data_still_needs_a_token(thumbnail_client: TestClient) -> None:
@@ -150,7 +190,7 @@ def test_preview_is_logged_without_a_workspace(thumbnail_client: TestClient, cap
     thumbnail_client.get(SMALL)
 
     record = next(json.loads(r.getMessage()) for r in caplog.records if r.name == "data_objects.access")
-    assert (record["status"], record["thumbnail"]) == (307, True)
+    assert (record["status"], record["thumbnail"], record["bytes"]) == (200, True, len(PREVIEW_JPEG))
     assert "workspace" not in record
 
 

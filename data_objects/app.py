@@ -3,7 +3,8 @@
 HEAD is answered by the endpoint itself, from a server-side HeadObject (see Signer.head).
 
 Catalogue preview images need no token when thumbnails are configured (decision 6). They
-are signed by a separate role that can read nothing else, and the Hub pays for them.
+are read by a separate role that can read nothing else, and the Hub pays for them. A GET of
+a preview returns the image itself, not a redirect, so a web map can draw it.
 """
 
 import json
@@ -22,7 +23,7 @@ from fastapi.responses import JSONResponse
 
 from data_objects.auth import AuthError, Verifier, authenticate
 from data_objects.settings import Bucket, ObjectRef, Settings
-from data_objects.signer import Missing, Signer
+from data_objects.signer import Missing, Signer, TooLarge
 
 ROUTE_PREFIX = "/api/data/objects"
 
@@ -33,6 +34,11 @@ READINESS_SESSION = "_readiness-check"
 # The role session name for preview images. The thumbnail role is separate from the signer
 # role, so this cannot be confused with a workspace in CloudTrail.
 THUMBNAIL_SESSION = "catalogue-thumbnails"
+
+# The largest preview image the endpoint returns. Landsat's large preview is about 130 KB.
+# The endpoint reads a preview whole before it answers, so this bounds the memory a request
+# can use if a suffix ever matches a big object.
+MAX_PREVIEW_BYTES = 2 * 1024 * 1024
 
 access_log = logging.getLogger("data_objects.access")
 log = logging.getLogger("data_objects")
@@ -117,7 +123,8 @@ def create_app(
     app = FastAPI(title="EODH data objects", lifespan=lifespan)
 
     # Responses to browsers need CORS headers, or the browser stops before following the
-    # redirect. Browser JavaScript still cannot read usgs-landsat itself, which has no CORS.
+    # redirect. Browser JavaScript still cannot read usgs-landsat itself, which has no CORS,
+    # so preview images are returned by the endpoint rather than redirected.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -221,19 +228,23 @@ def _thumbnail(
         _access(record | {"status": 200})
         return Response(status_code=200, headers=head.headers | {"X-Request-Id": request_id})
 
+    # The image itself, not a redirect. A web map draws previews with WebGL, which needs CORS
+    # headers on the image, and the requester-pays bucket sends none.
     try:
-        url = signer.presign(workspace=THUMBNAIL_SESSION, bucket=bucket, key=key)
+        body = signer.get(workspace=THUMBNAIL_SESSION, bucket=bucket, key=key, max_bytes=MAX_PREVIEW_BYTES)
     except (ClientError, BotoCoreError) as e:
         _access(record | {"status": 502, "error": str(e)[:200]})
-        return JSONResponse({"detail": "Cannot sign the request"}, status_code=502)
-    _access(record | {"status": 307})
-    # A browser may reuse this redirect, so a catalogue page shown again does not ask the
-    # endpoint, or sign, again. Settings keeps max-age shorter than the URL lifetime.
+        return JSONResponse({"detail": "Cannot read the preview"}, status_code=502)
+    if isinstance(body, Missing):
+        _access(record | {"status": 404, "s3_status": body.s3_status, "s3_code": body.s3_code})
+        return JSONResponse({"detail": "Not found"}, status_code=404)
+    if isinstance(body, TooLarge):
+        _access(record | {"status": 502, "error": f"preview is {body.size} bytes, over {MAX_PREVIEW_BYTES}"})
+        return JSONResponse({"detail": "Cannot read the preview"}, status_code=502)
+    _access(record | {"status": 200, "bytes": len(body.content)})
     return Response(
-        status_code=307,
-        headers={
-            "Location": url,
-            "Cache-Control": f"max-age={int(cache_max_age.total_seconds())}",
-            "X-Request-Id": request_id,
-        },
+        content=body.content,
+        status_code=200,
+        headers=body.headers
+        | {"Cache-Control": f"max-age={int(cache_max_age.total_seconds())}", "X-Request-Id": request_id},
     )

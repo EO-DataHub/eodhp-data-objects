@@ -130,6 +130,13 @@ def test_thumbnail_suffixes_belong_to_their_bucket() -> None:
     assert not settings.is_thumbnail("other-bucket", "x/X_thumb_large.jpeg")
 
 
+def test_thumbnail_cache_may_outlast_the_url_lifetime() -> None:
+    # Previews are returned, not redirected, so a cached preview never points at an expired URL.
+    thumbnails = load_settings(ENV | THUMBNAIL_ENV | {"THUMBNAIL_CACHE_SECONDS": "86400"}).thumbnails
+    assert thumbnails is not None
+    assert thumbnails.cache_max_age == timedelta(days=1)
+
+
 def test_thumbnail_cache_is_configurable() -> None:
     thumbnails = load_settings(ENV | THUMBNAIL_ENV | {"THUMBNAIL_CACHE_SECONDS": "60"}).thumbnails
 
@@ -153,7 +160,6 @@ def _buckets_with_suffixes(suffixes: object) -> str:
         ({"BUCKETS": BUCKETS}, "no bucket in BUCKETS has thumbnail_suffixes"),
         ({"BUCKETS": _buckets_with_suffixes(["_thumb_small.jpeg", ""])}, "list of non-empty strings"),
         ({"BUCKETS": _buckets_with_suffixes("_thumb_small.jpeg")}, "list of non-empty strings"),
-        ({"THUMBNAIL_CACHE_SECONDS": "900"}, "shorter than the URL lifetime"),
         ({"THUMBNAIL_CACHE_SECONDS": "-1"}, "cannot be negative"),
     ],
 )

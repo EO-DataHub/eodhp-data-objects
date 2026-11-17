@@ -60,7 +60,7 @@ class Thumbnails:
     """Anonymous preview images (ADR-003, decision 6).
 
     A key that ends with one of its bucket's `thumbnail_suffixes` needs no token. The
-    endpoint signs it as `role_arn`, whose IAM policy allows only these keys, so a bug here
+    endpoint reads it as `role_arn`, whose IAM policy allows only these keys, so a bug here
     cannot sign a read of data. The Hub pays, and no workspace is charged.
     """
 
@@ -68,8 +68,8 @@ class Thumbnails:
     # A preview image that exists, read at startup as `role_arn`, as READINESS_OBJECT is for
     # the signer role. It must be a preview by the same rule that requests use.
     readiness_object: ObjectRef
-    # How long a browser may reuse the redirect. Must be shorter than the URL lifetime, or a
-    # browser could follow a cached redirect to an expired URL.
+    # How long a browser may reuse a preview image. The endpoint returns the image itself, not
+    # a redirect, so this does not depend on the URL lifetime.
     cache_max_age: timedelta = DEFAULT_THUMBNAIL_CACHE
 
 
@@ -136,11 +136,6 @@ class Settings:
             )
         if thumbnails.cache_max_age < timedelta(0):
             raise SettingsError("THUMBNAIL_CACHE_SECONDS cannot be negative")
-        if thumbnails.cache_max_age >= self.url_lifetime:
-            raise SettingsError(
-                "THUMBNAIL_CACHE_SECONDS must be shorter than the URL lifetime, "
-                "or a browser could follow a cached redirect to an expired URL"
-            )
 
 
 def _parse_buckets(raw: str) -> dict[str, Bucket]:

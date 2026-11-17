@@ -32,11 +32,13 @@ Each request writes one JSON line to the `data_objects.access` log on stdout. Th
 
 When `THUMBNAIL_ROLE_ARN` is set, catalogue preview images need no token (ADR-003, decision 6). A preview is a key that ends with one of its bucket's `thumbnail_suffixes` in `BUCKETS`. For Landsat they are `_thumb_small.jpeg` and `_thumb_large.jpeg`. A key with the same ending in a bucket without `thumbnail_suffixes` is data, and needs a token.
 
-- The service signs previews as the thumbnail role, with the session name `catalogue-thumbnails`. That role's IAM policy should allow only preview keys, so a bug in the service cannot sign a read of data.
+- The service reads previews as the thumbnail role, with the session name `catalogue-thumbnails`. That role's IAM policy should allow only preview keys, so a bug in the service cannot read data.
 - The Hub pays, and no workspace is charged. A token sent with a preview is ignored, even one that is not valid.
-- A GET returns `307` with `Cache-Control: max-age=<THUMBNAIL_CACHE_SECONDS>`, so a browser reuses the redirect instead of asking again for each page view.
+- A GET returns `200` with the image itself, not a redirect, and `Cache-Control: max-age=<THUMBNAIL_CACHE_SECONDS>`. A web map, such as the catalogue UI's MapLibre map, draws an image with WebGL, which needs CORS headers on the image. The service sends them, and the requester-pays bucket does not. The response has the object's `Content-Type`, `Content-Length`, `ETag` and `Last-Modified`. It does not support `Range`.
+- The service refuses a preview bigger than 2 MB with `502`, before it reads the body. A Landsat large preview is about 130 KB.
+- A missing preview is `404`, as for HEAD.
 - HEAD is answered from `HeadObject`, as for other objects.
-- The access log line has `"thumbnail": true` and no workspace.
+- The access log line has `"thumbnail": true`, the number of bytes returned, and no workspace.
 
 The service does not limit how often a preview is requested. The ingress that serves previews without a login must do that.
 
@@ -54,9 +56,9 @@ Without `THUMBNAIL_ROLE_ARN`, and with no bucket that has `thumbnail_suffixes`, 
 | `URL_LIFETIME_SECONDS` | no | `900` | How long a presigned URL is valid |
 | `SESSION_DURATION_SECONDS` | no | `3600` | How long each workspace's STS session lasts. At least 900, and at most the role's maximum session duration. |
 | `SESSION_REFRESH_MARGIN_SECONDS` | no | `1200` | A session is replaced when less than this remains |
-| `THUMBNAIL_ROLE_ARN` | with `thumbnail_suffixes` | | The role that signs preview images. Setting it makes previews anonymous. The service refuses to start if it is set and no bucket has `thumbnail_suffixes`, or if a bucket has them and it is not set. |
+| `THUMBNAIL_ROLE_ARN` | with `thumbnail_suffixes` | | The role that reads preview images. Setting it makes previews anonymous. The service refuses to start if it is set and no bucket has `thumbnail_suffixes`, or if a bucket has them and it is not set. |
 | `THUMBNAIL_READINESS_OBJECT` | with `THUMBNAIL_ROLE_ARN` | | `<bucket>/<key>` of a preview image that exists. It must be a preview by the same rule as requests: in a bucket with `thumbnail_suffixes`, and ending with one of them. |
-| `THUMBNAIL_CACHE_SECONDS` | no | `300` | `max-age` on a preview redirect. Must be shorter than `URL_LIFETIME_SECONDS`. |
+| `THUMBNAIL_CACHE_SECONDS` | no | `300` | `max-age` on a preview image |
 
 The service refuses to start unless `URL_LIFETIME_SECONDS` ≤ `SESSION_REFRESH_MARGIN_SECONDS` < `SESSION_DURATION_SECONDS`, and `SESSION_DURATION_SECONDS` is between 15 minutes and 12 hours (the limits STS sets). The first rule makes sure every URL is valid for its full lifetime.
 
