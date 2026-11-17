@@ -22,7 +22,8 @@ from botocore.exceptions import ClientError
 
 from data_objects.settings import Bucket
 
-# Response fields from HeadObject that the endpoint passes on when it answers a HEAD itself.
+# Response fields from HeadObject and GetObject that the endpoint passes on when it answers
+# a request itself.
 HEAD_HEADERS = {
     "ContentLength": "Content-Length",
     "ContentType": "Content-Type",
@@ -46,6 +47,19 @@ class _Session:
 @dataclass(frozen=True)
 class ObjectHead:
     headers: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ObjectBody:
+    content: bytes
+    headers: dict[str, str]
+
+
+@dataclass(frozen=True)
+class TooLarge:
+    """GetObject found an object bigger than the caller's limit. Its body was not read."""
+
+    size: int
 
 
 @dataclass(frozen=True)
@@ -113,14 +127,39 @@ class Signer:
                 return Missing(s3_status=status, s3_code=str(e.response.get("Error", {}).get("Code", "")))
             raise
 
-        headers = {"Accept-Ranges": "bytes"}
-        for name, header in HEAD_HEADERS.items():
-            if name in response:
-                value = response[name]
-                headers[header] = (
-                    format_datetime(value.astimezone(UTC), usegmt=True) if isinstance(value, datetime) else str(value)
-                )
-        return ObjectHead(headers=headers)
+        return ObjectHead(headers={"Accept-Ranges": "bytes"} | _object_headers(response))
+
+    def get(self, *, workspace: str, bucket: Bucket, key: str, max_bytes: int) -> ObjectBody | TooLarge | Missing:
+        """GetObject as the workspace's session, for the endpoint to return the bytes itself.
+
+        For preview images only. A browser can draw an image from a redirect, but a map that
+        draws it with WebGL needs CORS headers on the image, and the requester-pays bucket
+        sends none. The object is read whole, so `max_bytes` stops a large object from being
+        read into memory: a larger one is refused before its body is read.
+
+        Raises ClientError for any S3 failure other than those in MISSING_STATUSES.
+        """
+        params: dict[str, str] = {"Bucket": bucket.name, "Key": key}
+        if bucket.requester_pays:
+            params["RequestPayer"] = "requester"
+        s3 = self._session(workspace, bucket.region).s3
+        try:
+            response = s3.get_object(**params)
+        except ClientError as e:
+            status = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+            if status in MISSING_STATUSES:
+                return Missing(s3_status=status, s3_code=str(e.response.get("Error", {}).get("Code", "")))
+            raise
+
+        body = response["Body"]
+        try:
+            size = int(response["ContentLength"])
+            if size > max_bytes:
+                return TooLarge(size=size)
+            content = body.read()
+        finally:
+            body.close()
+        return ObjectBody(content=content, headers=_object_headers(response))
 
     def _session(self, workspace: str, region: str) -> _Session:
         key = (workspace, region)
@@ -151,6 +190,18 @@ class Signer:
         if cached and cached.expires - self._now() > self._refresh_margin:
             return cached
         return None
+
+
+def _object_headers(response: dict[str, Any]) -> dict[str, str]:
+    """The HEAD_HEADERS that S3 sent, as HTTP header values."""
+    headers: dict[str, str] = {}
+    for name, header in HEAD_HEADERS.items():
+        if name in response:
+            value = response[name]
+            headers[header] = (
+                format_datetime(value.astimezone(UTC), usegmt=True) if isinstance(value, datetime) else str(value)
+            )
+    return headers
 
 
 def _request_payer_in_query(request: Any, **_: Any) -> None:

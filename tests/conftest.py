@@ -20,6 +20,7 @@ T0 = datetime(2026, 11, 5, 12, 0, tzinfo=UTC)
 LANDSAT = Bucket(name="usgs-landsat", region="us-west-2", requester_pays=True)
 OPEN_BUCKET = Bucket(name="hub-open-data", region="eu-west-2", requester_pays=False)
 READINESS_KEY = "collection02/level-2/x/X_MTL.json"
+PREVIEW_JPEG = b"\xff\xd8\xff\xe0 a small JPEG \xff\xd9"
 
 
 class Clock:
@@ -58,13 +59,17 @@ def s3_error(status: int, code: str) -> ClientError:
 
 class FakeS3:
     """The real S3 client for presigning, which is local, so the URLs under test are the ones
-    boto3 really produces. head_object is canned: `errors` maps a key to the S3 error it gets,
-    and any other key exists."""
+    boto3 really produces. head_object and get_object are canned: `errors` maps a key to the
+    S3 error it gets, and any other key exists. `sizes` maps a key to its size in bytes, for
+    keys that should not have the default small body."""
 
-    def __init__(self, real: Any, errors: dict[str, ClientError]) -> None:
+    def __init__(self, real: Any, errors: dict[str, ClientError], sizes: dict[str, int] | None = None) -> None:
         self._real = real
         self._errors = errors
+        self._sizes = sizes if sizes is not None else {}
         self.heads: list[dict[str, Any]] = []
+        self.gets: list[dict[str, Any]] = []
+        self.bodies: list[FakeBody] = []
 
     def generate_presigned_url(self, *args: Any, **kwargs: Any) -> str:
         return self._real.generate_presigned_url(*args, **kwargs)
@@ -79,6 +84,37 @@ class FakeS3:
             "ETag": '"abc"',
             "LastModified": datetime(2026, 11, 2, 0, 0, tzinfo=tzutc()),  # what boto3 returns
         }
+
+    def get_object(self, **kwargs: Any) -> dict[str, Any]:
+        self.gets.append(kwargs)
+        if kwargs["Key"] in self._errors:
+            raise self._errors[kwargs["Key"]]
+        size = self._sizes.get(kwargs["Key"], len(PREVIEW_JPEG))
+        body = FakeBody(PREVIEW_JPEG)
+        self.bodies.append(body)
+        return {
+            "Body": body,
+            "ContentLength": size,
+            "ContentType": "image/jpeg",
+            "ETag": '"jpeg"',
+            "LastModified": datetime(2026, 11, 2, 0, 0, tzinfo=tzutc()),
+        }
+
+
+class FakeBody:
+    """A botocore StreamingBody stand-in that records whether it was read and closed."""
+
+    def __init__(self, content: bytes) -> None:
+        self._content = content
+        self.read_called = False
+        self.closed = False
+
+    def read(self) -> bytes:
+        self.read_called = True
+        return self._content
+
+    def close(self) -> None:
+        self.closed = True
 
 
 @pytest.fixture
@@ -100,6 +136,12 @@ def s3_errors() -> dict[str, ClientError]:
 @pytest.fixture
 def s3_clients() -> list[FakeS3]:
     return []
+
+
+@pytest.fixture
+def s3_sizes() -> dict[str, int]:
+    """Keys whose GetObject reports a size other than the small default body's."""
+    return {}
 
 
 @pytest.fixture
